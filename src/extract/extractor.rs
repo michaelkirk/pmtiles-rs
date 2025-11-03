@@ -356,7 +356,7 @@ impl<'a, B: AsyncBackend + Sync + Send, C: DirectoryCache + Sync + Send> Extract
                                 idx + 1,
                             );
 
-                        let bytes = self.backend().read_exact(src_offset, length).await?;
+                        let bytes = self.backend().read(src_offset, length).await?;
 
                         // Write the fetched data to output
                         let dst_offset = new_header.data_offset + overfetch_range.range.dst_offset;
