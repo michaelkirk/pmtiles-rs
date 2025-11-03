@@ -349,6 +349,8 @@ impl<'a, B: AsyncBackend + Sync + Send, C: DirectoryCache + Sync + Send> Extract
                     let output = output.clone();
                     let total_tile_transfer_bytes = plan.total_tile_transfer_bytes();
                     async move {
+                        use futures_util::TryStreamExt;
+
                         let src_offset = usize::try_from(data_offset + overfetch_range.range.src_offset).map_err(PmtError::IoRangeOverflow)?;
                         let length = usize::try_from(overfetch_range.range.length).map_err(PmtError::IoRangeOverflow)?;
                         log::debug!(
@@ -356,7 +358,29 @@ impl<'a, B: AsyncBackend + Sync + Send, C: DirectoryCache + Sync + Send> Extract
                                 idx + 1,
                             );
 
-                        let bytes = self.backend().read(src_offset, length).await?;
+                        // Get the byte stream
+                        let byte_stream = self.backend().read_stream(src_offset, length);
+                        futures_util::pin_mut!(byte_stream);
+
+                        // Collect all chunks from the stream
+                        let mut chunks = Vec::new();
+                        while let Some(chunk) = byte_stream.try_next().await? {
+                            chunks.push(chunk);
+                        }
+
+                        // Concatenate chunks into single buffer
+                        let bytes = if chunks.is_empty() {
+                            Bytes::new()
+                        } else if chunks.len() == 1 {
+                            chunks.into_iter().next().expect("chunks.len() == 1")
+                        } else {
+                            let total_len: usize = chunks.iter().map(Bytes::len).sum();
+                            let mut result = Vec::with_capacity(total_len);
+                            for chunk in chunks {
+                                result.extend_from_slice(&chunk);
+                            }
+                            Bytes::from(result)
+                        };
 
                         // Write the fetched data to output
                         let dst_offset = new_header.data_offset + overfetch_range.range.dst_offset;
