@@ -362,38 +362,56 @@ impl<'a, B: AsyncBackend + Sync + Send, C: DirectoryCache + Sync + Send> Extract
                         let byte_stream = self.backend().read_stream(src_offset, length);
                         futures_util::pin_mut!(byte_stream);
 
-                        // Collect all chunks from the stream
-                        let mut chunks = Vec::new();
-                        while let Some(chunk) = byte_stream.try_next().await? {
-                            chunks.push(chunk);
-                        }
-
-                        // Concatenate chunks into single buffer
-                        let bytes = if chunks.is_empty() {
-                            Bytes::new()
-                        } else if chunks.len() == 1 {
-                            chunks.into_iter().next().expect("chunks.len() == 1")
-                        } else {
-                            let total_len: usize = chunks.iter().map(Bytes::len).sum();
-                            let mut result = Vec::with_capacity(total_len);
-                            for chunk in chunks {
-                                result.extend_from_slice(&chunk);
-                            }
-                            Bytes::from(result)
-                        };
-
-                        // Write the fetched data to output
+                        // Write the fetched data to output, streaming chunks as they arrive
                         let dst_offset = new_header.data_offset + overfetch_range.range.dst_offset;
 
                         let mut output = output.write().await;
                         output.seek(SeekFrom::Start(dst_offset))?;
-                        // Process copy/discard instructions - write wanted bytes, skip discard bytes
-                        let mut pos = 0;
-                        for cd in &overfetch_range.copy_discards {
-                            let wanted = usize::try_from(cd.wanted).map_err(PmtError::IoRangeOverflow)?;
-                            let discard = usize::try_from(cd.discard).map_err(PmtError::IoRangeOverflow)?;
-                            output.write_all(&bytes[pos..pos + wanted])?;
-                            pos += wanted + discard;
+
+                        // Track which copy/discard instruction we're processing
+                        let mut cd_idx = 0_usize; // Current copy/discard instruction index
+                        let mut cd_pos = 0_usize; // Position within current copy/discard instruction
+
+                        // Process chunks as they arrive
+                        while let Some(chunk) = byte_stream.try_next().await? {
+                            let mut chunk_offset = 0_usize;
+
+                            while chunk_offset < chunk.len() {
+                                if cd_idx >= overfetch_range.copy_discards.len() {
+                                    break;
+                                }
+
+                                let cd = &overfetch_range.copy_discards[cd_idx];
+                                let wanted = usize::try_from(cd.wanted).map_err(PmtError::IoRangeOverflow)?;
+                                let discard = usize::try_from(cd.discard).map_err(PmtError::IoRangeOverflow)?;
+                                let total_cd_len = wanted + discard;
+
+                                // Determine if we're in the "wanted" or "discard" portion
+                                if cd_pos < wanted {
+                                    // We're in the wanted portion
+                                    let remaining_wanted = wanted - cd_pos;
+                                    let remaining_chunk = chunk.len() - chunk_offset;
+                                    let to_write = remaining_wanted.min(remaining_chunk);
+
+                                    output.write_all(&chunk[chunk_offset..chunk_offset + to_write])?;
+                                    chunk_offset += to_write;
+                                    cd_pos += to_write;
+                                } else {
+                                    // We're in the discard portion
+                                    let remaining_discard = total_cd_len - cd_pos;
+                                    let remaining_chunk = chunk.len() - chunk_offset;
+                                    let to_skip = remaining_discard.min(remaining_chunk);
+
+                                    chunk_offset += to_skip;
+                                    cd_pos += to_skip;
+                                }
+
+                                // Move to next copy/discard instruction if we've finished this one
+                                if cd_pos >= total_cd_len {
+                                    cd_idx += 1;
+                                    cd_pos = 0;
+                                }
+                            }
                         }
                         drop(output);
 
