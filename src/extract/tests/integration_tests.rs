@@ -7,6 +7,9 @@ use crate::extract::{BoundingBox, Extractor};
 use crate::header::HEADER_SIZE;
 use crate::{AsyncPmTilesReader, MmapBackend};
 
+#[cfg(feature = "http-async")]
+use crate::HttpBackend;
+
 #[tokio::test]
 async fn test_extract_firenze_small_bbox() {
     // Port of: TestExtract (go-pmtiles/pmtiles/extract_test.go:80)
@@ -146,4 +149,59 @@ async fn test_extract_overfetch_reduces_requests() {
         stats_high.addressed_tiles(),
         "Should extract same number of tiles"
     );
+}
+
+#[cfg(feature = "http-async")]
+#[tokio::test]
+#[ignore] // Requires local server at http://localhost:8001
+async fn test_extract_seattle_from_http() {
+    // Test extracting Seattle area from HTTP backend
+    // This test requires a local server running at:
+    // http://localhost:8001/pmtiles/maps-earth-planet-v1.250915.pmtiles
+    //
+    // To run this test:
+    // cargo test --all-features test_extract_seattle_from_http -- --ignored
+
+    let url = "http://localhost:8001/pmtiles/maps-earth-planet-v1.250915.pmtiles";
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
+        .build()
+        .unwrap();
+
+    let backend = HttpBackend::try_from(client, url).unwrap();
+    let mut reader = AsyncPmTilesReader::try_from_source(backend).await.unwrap();
+
+    // Seattle bbox: west=-122.462, south=47.394, east=-122.005, north=47.831
+    let bbox = BoundingBox::from_nesw(47.831, -122.005, 47.394, -122.462);
+
+    // Extract to memory
+    let mut output = Cursor::new(Vec::new());
+    let extractor = Extractor::new(&mut reader);
+    let stats = extractor
+        .extract_bbox_to_writer(bbox, &mut output)
+        .await
+        .unwrap();
+
+    let output_bytes = output.into_inner();
+
+    // Compare against expected fixture
+    let expected_bytes = std::fs::read("fixtures/seattle.pmtiles").unwrap();
+    assert_eq!(
+        output_bytes.len(),
+        expected_bytes.len(),
+        "Output size should match fixture"
+    );
+    assert_eq!(
+        output_bytes, expected_bytes,
+        "Extracted output should match fixture exactly"
+    );
+
+    // Verify stats for documentation
+    println!("Successfully extracted {} tiles", stats.addressed_tiles());
+    println!("Tile data length: {} bytes", stats.tile_data_length());
+    println!(
+        "Total bytes transferred: {} bytes",
+        stats.total_tile_transfer_bytes()
+    );
+    println!("Output file size: {} bytes", output_bytes.len());
 }
